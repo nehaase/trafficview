@@ -428,21 +428,21 @@ class TestHauptschleife(unittest.TestCase):
             with open(os.path.join(tmp, "spuren.json"), "w") as f:
                 json.dump({"rois": [[0.0, 0.0, 1.0, 1.0]],
                            "linien": [{"name": "L", "p1": [0.0, 0.5], "p2": [1.0, 0.5]}]}, f)
+            alt_cwd = os.getcwd()
+            self.addCleanup(os.chdir, alt_cwd)      # main() schreibt ggf. Dateien ins Arbeitsverzeichnis
+            os.chdir(tmp)
             for extra, erwartet, geister in (([], 3, 1), (["--ohne-geisterzaehlung"], 2, 0)):
                 argv = ["trafficview.py", video, "--spuren", os.path.join(tmp, "spuren.json"),
                         "--csv", os.path.join(tmp, "out.csv"), "--show", "--debug", "--skip", "1"] + extra
                 ausgabe = io.StringIO()
-                alt_cwd = os.getcwd()
-                os.chdir(tmp)
-                self.addCleanup(os.chdir, alt_cwd)
                 with mock.patch.dict(sys.modules, _attrappen(aufrufe_max=n)), mock.patch.object(sys, "argv", argv), \
                         mock.patch.object(cv2, "imshow"), mock.patch.object(cv2, "waitKey", return_value=-1), \
                         mock.patch.object(cv2, "destroyAllWindows"), contextlib.redirect_stdout(ausgabe):
                     tv.main()
                 text = ausgabe.getvalue()
                 self.assertIn("Endergebnis", text)
-                zeilen = text.split("Endergebnis:")[1].strip().splitlines()
-                summen = [int(z.split()[-1]) for z in zeilen if z.startswith("  ")]
+                zeilen = text.split("Endergebnis:")[1].splitlines()
+                summen = [int(z.split()[-1]) for z in zeilen if z.startswith("  ")]     # Ergebniszeilen sind eingerückt
                 self.assertEqual(sum(summen), erwartet, f"{extra}: erwartet {erwartet} Fahrzeuge, Ausgabe:\n{text}")
                 self.assertIn(f"davon über Geisterbox gezählt: {geister}", text)
 
