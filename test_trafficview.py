@@ -24,7 +24,8 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import trafficview as tv
-from trafficview import EinfacherTracker, UeberfahrtZaehler, segmente_schneiden, seite
+from trafficview import (EinfacherTracker, SofortZaehler, UeberfahrtZaehler, empfohlener_skip, lade_konfig,
+                         neuer_csv_name, segmente_schneiden, seite)
 
 
 # ----------------------------------------------------------------------------
@@ -161,6 +162,27 @@ class TestGeometrie(unittest.TestCase):
     def test_seite(self):
         self.assertGreater(seite((5, 10), (0, 5), (10, 5)), 0)
         self.assertLess(seite((5, 0), (0, 5), (10, 5)), 0)
+
+
+class TestCsvName(unittest.TestCase):
+    def test_name_nach_datum_und_uhrzeit(self):
+        from datetime import datetime
+        with tempfile.TemporaryDirectory() as tmp:
+            pfad = neuer_csv_name(datetime(2026, 11, 8, 14, 5, 9), tmp)
+            self.assertEqual(os.path.basename(pfad), "tracking-data-2026-11-08-14-05-09.csv")
+
+    def test_vorhandene_datei_wird_nie_ueberschrieben(self):
+        from datetime import datetime
+        zeit = datetime(2026, 11, 8, 14, 5, 9)
+        with tempfile.TemporaryDirectory() as tmp:
+            erste = neuer_csv_name(zeit, tmp)
+            open(erste, "w").close()
+            zweite = neuer_csv_name(zeit, tmp)
+            open(zweite, "w").close()
+            dritte = neuer_csv_name(zeit, tmp)
+            self.assertEqual([os.path.basename(p) for p in (erste, zweite, dritte)],
+                             ["tracking-data-2026-11-08-14-05-09.csv", "tracking-data-2026-11-08-14-05-09-2.csv",
+                              "tracking-data-2026-11-08-14-05-09-3.csv"])
 
 
 class TestBewegungspruefung(unittest.TestCase):
@@ -306,6 +328,171 @@ class TestGeisterZaehlung(unittest.TestCase):
 
 
 # ----------------------------------------------------------------------------
+# Interstate-Modus (keine Zähllinien: Fahrzeug zählt beim ersten Erkennen im Bereich)
+# ----------------------------------------------------------------------------
+class TestInterstateBausteine(unittest.TestCase):
+    def test_empfohlener_skip(self):
+        self.assertEqual(empfohlener_skip(None, 44, 4), 1)          # Tempo unbekannt: vorsichtig
+        self.assertEqual(empfohlener_skip(0, 44, 4), 1)
+        self.assertEqual(empfohlener_skip(27, 44, 4), 1)            # schnell: jedes Frame
+        self.assertEqual(empfohlener_skip(19, 44, 4), 2)            # höchstens eine Boxgröße je ausgewertetem Frame
+        self.assertEqual(empfohlener_skip(7, 44, 4), 4)             # langsam: durch max_skip begrenzt
+        self.assertEqual(empfohlener_skip(7, 44, 1), 1)
+
+    def test_sofortzaehler_zaehlt_jedes_fahrzeug_einmal(self):
+        z = SofortZaehler()
+        z.neuer_frame()
+        self.assertTrue(z.pruefen("a"))
+        for _ in range(5):
+            z.neuer_frame()
+            self.assertFalse(z.pruefen("a"))
+        self.assertTrue(z.pruefen("b"))
+
+    def test_sofortzaehler_wartet_bis_das_fahrzeug_als_solches_gilt(self):
+        z = SofortZaehler()
+        self.assertFalse(z.pruefen("m", gilt_als_fahrzeug=False))
+        self.assertFalse(z.pruefen("m", gilt_als_fahrzeug=False))
+        self.assertTrue(z.pruefen("m", gilt_als_fahrzeug=True))
+        self.assertFalse(z.pruefen("m", gilt_als_fahrzeug=True))
+
+    def test_sofortzaehler_vergisst_lange_nicht_gesehene_schluessel(self):
+        z = SofortZaehler(aufbewahren=10)
+        z.neuer_frame(); z.pruefen("alt")
+        for _ in range(700):
+            z.neuer_frame()
+        self.assertNotIn("alt", z.gezaehlt)
+
+    def test_tracker_autobahn_rechnet_geschwindigkeit_bei_skip_wechsel_um(self):
+        tr = EinfacherTracker(autobahn=True, min_bewegung=0.0)
+        for y in range(0, 200, 10):
+            tr.update(np.array([[10.0, y, 54.0, y + 28.0]]), [0.5], 0.2)
+        vorher = tr.fluss
+        self.assertIsNotNone(vorher)
+        v_vorher = next(iter(tr.tracks.values()))["v"]
+        tr.skip_geaendert(2.0)
+        self.assertAlmostEqual(tr.fluss[1], 2 * vorher[1])
+        self.assertAlmostEqual(next(iter(tr.tracks.values()))["v"][1], 2 * v_vorher[1])
+
+    def test_tracker_autobahn_loescht_am_rand_nicht_sofort_und_meldet_beendete(self):
+        box = np.array([[100.0, 0.0, 144.0, 14.0]])                 # neu einfahrendes Fahrzeug am oberen Rand
+        for autobahn, erwartet_track in ((True, 1), (False, 0)):
+            tr = EinfacherTracker(autobahn=autobahn, min_bewegung=0.0)
+            tr.update(box, [0.5], 0.2, grenzen=(0, 0, 300, 150))
+            tr.update(np.zeros((0, 4)), [], 0.2, grenzen=(0, 0, 300, 150))    # ein Aussetzer
+            self.assertEqual(len(tr.tracks), erwartet_track, f"autobahn={autobahn}")
+        tr = EinfacherTracker(autobahn=True, min_bewegung=0.0, max_luecke=1)
+        tr.update(box, [0.5], 0.2); tr.update(box, [0.5], 0.2)
+        for _ in range(3):
+            tr.update(np.zeros((0, 4)), [], 0.2)
+        self.assertEqual(tr.beendet, [2])                           # Track mit 2 Sichtungen beendet
+
+    def test_tracker_ordnet_langsames_fahrzeug_nicht_der_nachbarspur_zu(self):
+        """Regression: Track sprang bei einem Aussetzer 85 px zur Seite auf ein Fahrzeug der Nachbarspur."""
+        tr = EinfacherTracker(autobahn=True, min_bewegung=0.0, max_tempo=3.0, max_luecke=3)
+        a, b = 148.0, 63.0
+        for k in range(8):                                          # Fahrzeug A in Spur 2, 6 px/Frame
+            tr.update(np.array([[a - 22, 10.0 + 6 * k, a + 22, 38.0 + 6 * k]]), [0.5], 0.2, grenzen=(0, 0, 300, 150))
+        id_a = next(iter(tr.tracks))
+        # A fällt aus, in der Nachbarspur taucht Fahrzeug B auf
+        ids = tr.update(np.array([[b - 22, 0.0, b + 22, 9.0]]), [0.5], 0.2, grenzen=(0, 0, 300, 150))
+        self.assertNotEqual(ids[0], id_a)
+
+    def test_konfiguration_ohne_linien_ergibt_leere_linienliste(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pfad = os.path.join(tmp, "spuren.json")
+            with open(pfad, "w") as f:
+                json.dump({"rois": [[0.1, 0.2, 0.9, 0.6]], "linien": []}, f)
+            with contextlib.redirect_stdout(io.StringIO()):
+                linien, rois = lade_konfig(pfad, 0.55)
+            self.assertEqual(linien, [])
+            self.assertEqual(rois, [[0.1, 0.2, 0.9, 0.6]])
+
+
+def interstate_lauf(seed, vmin, vmax, headway, skip=None, frames=1500, dropout=0.08, max_skip=4):
+    """
+    Dichter Verkehr auf drei Fahrspuren durch einen kleinen Bereich (300 x 150, Boxen 44 x 28), Zählung beim
+    ersten Erkennen. skip=None: automatische Regelung wie in main(). Gibt (gezählt, wahr, Ø skip) zurück.
+    """
+    w, h, fb, fh = 300, 150, 44.0, 28.0
+    rng = random.Random(seed)
+    fz, naechste = [], {x: rng.uniform(0, 30) for x in (60, 150, 240)}
+    for f in range(frames):
+        for x in naechste:
+            if f >= naechste[x]:
+                v = rng.uniform(vmin, vmax)
+                fz.append({"start": f, "x": x + rng.uniform(-5, 5), "v": v})
+                naechste[x] = f + max(2.2 * fh / v, rng.expovariate(1.0 / headway))
+    tr = EinfacherTracker(max_luecke=3, min_bewegung=0.0, max_tempo=3.0, autobahn=True)
+    sofort, n = SofortZaehler(), 0
+    f, aktuell, groesse_ema, genutzt = 0, (1 if skip is None else skip), None, []
+    while f < frames + 250:
+        boxen, konfs = [], []
+        for z in fz:
+            if f < z["start"]:
+                continue
+            y = -fh + z["v"] * (f - z["start"])
+            if y - fh / 2 > h:
+                continue
+            x1, y1, x2, y2 = z["x"] - fb / 2, y - fh / 2, z["x"] + fb / 2, y + fh / 2
+            cx1, cy1, cx2, cy2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
+            if cx2 <= cx1 or cy2 <= cy1:
+                continue
+            anteil = (cx2 - cx1) * (cy2 - cy1) / (fb * fh)
+            if anteil < 0.3 or rng.random() < dropout:
+                continue
+            konf = max(0.05, rng.gauss(0.35, 0.08) * anteil ** 0.5)
+            if konf >= 0.08:
+                boxen.append([cx1, cy1, cx2, cy2]); konfs.append(konf)
+        boxen = np.array(boxen, dtype=float).reshape(-1, 4)
+        ids = tr.update(boxen, konfs, 0.2, grenzen=(0, 0, w, h))
+        sofort.neuer_frame()
+        groessen = []
+        for b, tid in zip(boxen, ids):
+            if tid is not None:
+                groessen.append(max(b[2] - b[0], b[3] - b[1]))
+                n += sofort.pruefen(tid, tr.tracks[tid]["bewegt"])
+        if groessen:
+            m = sum(groessen) / len(groessen)
+            groesse_ema = m if groesse_ema is None else 0.95 * groesse_ema + 0.05 * m
+        genutzt.append(aktuell)
+        if skip is None:                                           # Regelung wie in main()
+            tempo = math.hypot(*tr.fluss) / aktuell if tr.fluss is not None else None
+            neu = empfohlener_skip(tempo, groesse_ema, max_skip)
+            if neu != aktuell:
+                tr.skip_geaendert(neu / aktuell)
+                aktuell = neu
+        f += aktuell
+    return n, len(fz), sum(genutzt) / len(genutzt)
+
+
+class TestInterstateSimulation(unittest.TestCase):
+    SZENEN = {"mittel": (12, 26, 20), "schnell": (20, 34, 14), "langsam": (4, 10, 20)}
+    SEEDS = range(3)
+
+    def _fehler(self, szene, skip=None):
+        erg = [interstate_lauf(s, *self.SZENEN[szene], skip=skip) for s in self.SEEDS]
+        wahr = sum(e[1] for e in erg)
+        return (sum(e[0] for e in erg) - wahr) / wahr, sum(e[2] for e in erg) / len(erg)
+
+    def test_jedes_frame_zaehlt_genau(self):
+        for szene in self.SZENEN:
+            fehler, _ = self._fehler(szene, skip=1)
+            self.assertLess(abs(fehler), 0.015, f"{szene}: {fehler:+.1%}")
+
+    def test_automatische_skip_regelung_zaehlt_genau_und_spart_frames_bei_langsamem_verkehr(self):
+        ergebnisse = {szene: self._fehler(szene) for szene in self.SZENEN}
+        for szene, (fehler, _) in ergebnisse.items():
+            self.assertLess(abs(fehler), 0.04, f"{szene}: {fehler:+.1%}")
+        self.assertLess(ergebnisse["schnell"][1], 1.5)            # schneller Verkehr: (fast) jedes Frame
+        self.assertGreater(ergebnisse["langsam"][1], 2.5)         # langsamer Verkehr: deutlich weniger Frames
+
+    def test_zu_grosser_skip_bei_schnellem_verkehr_zaehlt_falsch(self):
+        """Dokumentiert die Grenze, vor der die Regelung schützt."""
+        fehler, _ = self._fehler("schnell", skip=4)
+        self.assertLess(fehler, -0.15)
+
+
+# ----------------------------------------------------------------------------
 # Simulationen
 # ----------------------------------------------------------------------------
 class TestSimulation(unittest.TestCase):
@@ -406,45 +593,105 @@ def _attrappen(aufrufe_max):
     return {"torch": torch, "ultralytics": ultralytics, "ultralytics.cfg": cfg}
 
 
+def _erzeuge_video(pfad, w=360, h=240, n=90):
+    """Drei helle Fahrzeuge fahren abwärts (das dritte 'verschwindet' kurz vor der Mitte), dazu eine statische
+    helle Markierung. Gibt False zurück, wenn OpenCV hier kein Video schreiben kann."""
+    writer = cv2.VideoWriter(pfad, cv2.VideoWriter_fourcc(*"MJPG"), 25, (w, h))
+    if not writer.isOpened():
+        return False
+    for f in range(n):
+        bild = np.full((h, w, 3), 60, np.uint8)
+        cv2.rectangle(bild, (100, 130), (170, 142), (255, 255, 255), -1)                      # statische "Markierung"
+        for start, x, sichtbar_bis in ((5, 40, None), (30, 200, None), (20, 290, 114)):        # Fahrzeuge, abwärts
+            y = -30 + 6 * (f - start)
+            if f >= start and y < h and (sichtbar_bis is None or y + 30 <= sichtbar_bis):      # das 3. "verschwindet"
+                cv2.rectangle(bild, (x, max(0, y)), (x + 40, min(h - 1, y + 30)), (255, 255, 255), -1)
+        writer.write(bild)
+    writer.release()
+    return True
+
+
 class TestHauptschleife(unittest.TestCase):
-    def test_ende_zu_ende_mit_testvideo(self):
+    N = 90
+
+    def _starte(self, tmp, config, extra, aufrufe_max=None, csv_angeben=True):
+        """Führt main() mit Attrappen aus und gibt (Summe der Zählungen, Ausgabetext) zurück."""
+        with open(os.path.join(tmp, "spuren.json"), "w") as f:
+            json.dump(config, f)
+        argv = ["trafficview.py", os.path.join(tmp, "test.avi"), "--spuren", os.path.join(tmp, "spuren.json"),
+                "--show", "--debug", "--skip", "1"] + (["--csv", os.path.join(tmp, "out.csv")] if csv_angeben else []) + extra
+        ausgabe = io.StringIO()
+        with mock.patch.dict(sys.modules, _attrappen(aufrufe_max=aufrufe_max or self.N)), \
+                mock.patch.object(sys, "argv", argv), mock.patch.object(cv2, "imshow"), \
+                mock.patch.object(cv2, "waitKey", return_value=-1), mock.patch.object(cv2, "destroyAllWindows"), \
+                contextlib.redirect_stdout(ausgabe):
+            tv.main()
+        text = ausgabe.getvalue()
+        self.assertIn("Endergebnis", text)
+        zeilen = text.split("Endergebnis:")[1].splitlines()
+        return sum(int(z.split()[-1]) for z in zeilen if z.startswith("  ")), text
+
+    def _tmp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        alt_cwd = os.getcwd()
+        self.addCleanup(os.chdir, alt_cwd)             # main() schreibt ggf. Dateien ins Arbeitsverzeichnis
+        os.chdir(tmp.name)
+        if not _erzeuge_video(os.path.join(tmp.name, "test.avi"), n=self.N):
+            self.skipTest("OpenCV kann hier kein Testvideo schreiben")
+        return tmp.name
+
+    def test_ende_zu_ende_mit_zaehllinie(self):
         """Zwei Fahrzeuge fahren über die Linie, ein drittes verschwindet kurz davor (Geisterbox überquert die
         Linie), eine statische helle Markierung darf nicht gezählt werden."""
-        with tempfile.TemporaryDirectory() as tmp:
-            video = os.path.join(tmp, "test.avi")
-            w, h, n = 360, 240, 90
-            writer = cv2.VideoWriter(video, cv2.VideoWriter_fourcc(*"MJPG"), 25, (w, h))
-            if not writer.isOpened():
-                self.skipTest("OpenCV kann hier kein Testvideo schreiben")
-            for f in range(n):
-                bild = np.full((h, w, 3), 60, np.uint8)
-                cv2.rectangle(bild, (60, 130), (130, 142), (255, 255, 255), -1)           # statische "Markierung"
-                for start, x, sichtbar_bis in ((5, 40, None), (30, 200, None), (20, 290, 114)):   # Fahrzeuge, abwärts
-                    y = -30 + 6 * (f - start)
-                    if f >= start and y < h and (sichtbar_bis is None or y + 30 <= sichtbar_bis):  # das 3. "verschwindet"
-                        cv2.rectangle(bild, (x, max(0, y)), (x + 40, min(h - 1, y + 30)), (255, 255, 255), -1)
-                writer.write(bild)
-            writer.release()
-            with open(os.path.join(tmp, "spuren.json"), "w") as f:
-                json.dump({"rois": [[0.0, 0.0, 1.0, 1.0]],
-                           "linien": [{"name": "L", "p1": [0.0, 0.5], "p2": [1.0, 0.5]}]}, f)
-            alt_cwd = os.getcwd()
-            self.addCleanup(os.chdir, alt_cwd)      # main() schreibt ggf. Dateien ins Arbeitsverzeichnis
-            os.chdir(tmp)
-            for extra, erwartet, geister in (([], 3, 1), (["--ohne-geisterzaehlung"], 2, 0)):
-                argv = ["trafficview.py", video, "--spuren", os.path.join(tmp, "spuren.json"),
-                        "--csv", os.path.join(tmp, "out.csv"), "--show", "--debug", "--skip", "1"] + extra
-                ausgabe = io.StringIO()
-                with mock.patch.dict(sys.modules, _attrappen(aufrufe_max=n)), mock.patch.object(sys, "argv", argv), \
-                        mock.patch.object(cv2, "imshow"), mock.patch.object(cv2, "waitKey", return_value=-1), \
-                        mock.patch.object(cv2, "destroyAllWindows"), contextlib.redirect_stdout(ausgabe):
-                    tv.main()
-                text = ausgabe.getvalue()
-                self.assertIn("Endergebnis", text)
-                zeilen = text.split("Endergebnis:")[1].splitlines()
-                summen = [int(z.split()[-1]) for z in zeilen if z.startswith("  ")]     # Ergebniszeilen sind eingerückt
-                self.assertEqual(sum(summen), erwartet, f"{extra}: erwartet {erwartet} Fahrzeuge, Ausgabe:\n{text}")
-                self.assertIn(f"davon über Geisterbox gezählt: {geister}", text)
+        tmp = self._tmp()
+        config = {"rois": [[0.0, 0.0, 1.0, 1.0]], "linien": [{"name": "L", "p1": [0.0, 0.5], "p2": [1.0, 0.5]}]}
+        for extra, erwartet, geister in (([], 3, 1), (["--ohne-geisterzaehlung"], 2, 0)):
+            summe, text = self._starte(tmp, config, extra)
+            self.assertEqual(summe, erwartet, f"{extra}: erwartet {erwartet} Fahrzeuge, Ausgabe:\n{text}")
+            self.assertIn(f"davon über Geisterbox gezählt: {geister}", text)
+
+    def test_ende_zu_ende_interstate_ohne_linien(self):
+        """Keine Zähllinien in der Konfiguration: jedes Fahrzeug zählt beim ersten Erkennen im Bereich."""
+        tmp = self._tmp()
+        config = {"rois": [[0.0, 0.0, 1.0, 1.0]], "linien": []}
+        # Standard: sofort zählen, also auch die statische Markierung (einmal) -> 3 Fahrzeuge + 1
+        summe, text = self._starte(tmp, config, [])
+        self.assertIn("Interstate-Modus: keine Zähllinien", text)
+        self.assertIn("Bereich 1", text.split("Endergebnis:")[1])
+        self.assertEqual(summe, 4, text)
+        # Mit Bewegungsprüfung wird die statische Markierung nicht gezählt
+        summe, text = self._starte(tmp, config, ["--min-bewegung", "0.25"])
+        self.assertEqual(summe, 3, text)
+        self.assertIn("Sichtungen je Fahrzeug", text)
+
+    def test_interstate_kann_erzwungen_werden_und_ignoriert_dann_linien(self):
+        tmp = self._tmp()
+        config = {"rois": [[0.0, 0.0, 1.0, 1.0]], "linien": [{"name": "L", "p1": [0.0, 0.5], "p2": [1.0, 0.5]}]}
+        summe, text = self._starte(tmp, config, ["--interstate"])
+        self.assertEqual(summe, 4, text)
+        self.assertIn("Bereich 1", text.split("Endergebnis:")[1])
+
+    def test_jeder_lauf_schreibt_in_eine_neue_csv_datei(self):
+        """Ohne --csv: pro Lauf eine neue Datei tracking-data-<Datum>-<Uhrzeit>.csv mit Kopfzeile."""
+        tmp = self._tmp()
+        config = {"rois": [[0.0, 0.0, 1.0, 1.0]], "linien": [{"name": "L", "p1": [0.0, 0.5], "p2": [1.0, 0.5]}]}
+        ordner = os.path.join(tmp, "ausgabe")                       # wird bei Bedarf angelegt
+        for _ in range(2):
+            self._starte(tmp, config, ["--csv-ordner", ordner], csv_angeben=False)
+        dateien = sorted(os.listdir(ordner))
+        self.assertEqual(len(dateien), 2, dateien)
+        for name in dateien:
+            self.assertRegex(name, r"^tracking-data-\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}(-\d+)?\.csv$")
+            with open(os.path.join(ordner, name), encoding="utf-8") as f:
+                self.assertTrue(f.readline().startswith("zeit,linie,richtung"))
+        self.assertFalse(os.path.exists(os.path.join(tmp, "verkehr.csv")))
+
+    def test_interstate_ohne_bereich_bricht_mit_hinweis_ab(self):
+        tmp = self._tmp()
+        with self.assertRaises(SystemExit) as fehler:
+            self._starte(tmp, {"rois": [], "linien": []}, [])
+        self.assertIn("mindestens einen Auswertebereich", str(fehler.exception))
 
 if __name__ == "__main__":
     unittest.main()
