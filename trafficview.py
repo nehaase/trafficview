@@ -10,6 +10,8 @@ Verkehrszähler für öffentliche Kamera-Streams (z. B. von opencctv.org verlink
 - --skip auto: passt das Überspringen von Frames an die Rechenleistung an
 - Nutzt automatisch GPU (CUDA/Apple MPS), falls vorhanden
 - Minutenwerte pro Linie/Richtung in CSV
+- Interstate-Modus: Ohne Zähllinien (im Setup keine Linie gezeichnet) zählt jedes Fahrzeug beim ersten
+  Erkennen in einem Bereich; --skip auto wählt den Frame-Sprung passend zum Verkehrstempo
 
 Installation:
     pip install ultralytics opencv-python requests numpy
@@ -129,6 +131,21 @@ def schnittparameter(a, b, c, d):
     return min(1.0, max(0.0, s))
 
 
+def neuer_csv_name(jetzt=None, ordner="."):
+    """
+    Dateiname für die Zählwerte eines Programmlaufs: tracking-data-JJJJ-MM-TT-HH-MM-SS.csv (lokale Zeit des
+    Starts). Gibt es den Namen schon (zwei Starts in derselben Sekunde), wird -2, -3, ... angehängt.
+    """
+    jetzt = jetzt or datetime.now()
+    basis = f"tracking-data-{jetzt:%Y-%m-%d-%H-%M-%S}"
+    pfad = os.path.join(ordner, basis + ".csv")
+    nummer = 2
+    while os.path.exists(pfad):
+        pfad = os.path.join(ordner, f"{basis}-{nummer}.csv")
+        nummer += 1
+    return pfad
+
+
 def roi_in_pixel(roi, w, h):
     """Relativer ROI [x1,y1,x2,y2] -> Pixelgrenzen (None = ganzes Bild)."""
     if not roi:
@@ -178,13 +195,23 @@ class EinfacherTracker:
       nicht und werden weder gezählt noch gezeigt.
     """
 
-    def __init__(self, max_luecke=8, faktor=2.0, daempfung=0.8, min_bewegung=0.25, max_tempo=2.0):
+    def __init__(self, max_luecke=8, faktor=2.0, daempfung=0.8, min_bewegung=0.25, max_tempo=2.0,
+                 autobahn=False):
         self.max_luecke = max_luecke        # so viele Frames darf ein Fahrzeug fehlen
         self.faktor = faktor                # erlaubter Sprung in Fahrzeuggrößen
         self.daempfung = daempfung          # Geschwindigkeit nimmt bei fehlender Erkennung pro Frame ab
         self.min_bewegung = min_bewegung    # nötiger Weg (in Boxgrößen) im Fenster, bevor ein Track als Fahrzeug gilt
         self.max_tempo = max_tempo          # max. Geschwindigkeit in Boxgrößen pro Frame
         self.gedaechtnis = 8                # so viele Frames gilt ein Track nach der letzten Bewegung als Fahrzeug
+        # Autobahn-Modus (Zählung beim ersten Erkennen, kein Linien-Tracking): Alle Fahrzeuge fahren in dieselbe
+        # Richtung. Der Tracker lernt die mittlere Strömung (Richtung/Tempo je Frame) und erwartet auch Tracks
+        # ohne eigene Geschwindigkeit entsprechend. Tracks am Bereichsrand werden nicht sofort gelöscht,
+        # weil dort neu einfahrende Fahrzeuge zuerst auftauchen.
+        self.autobahn = autobahn
+        self.laengs_rel = 0.45              # Tempo-Toleranz entlang der Fahrtrichtung (Anteil des Tempos)
+        self.fluss = None                   # (vx, vy) je ausgewertetem Frame
+        self._fluss_proben = []             # erste Messungen, bevor die Strömung feststeht
+        self.beendet = []                   # Trefferzahlen beendeter Tracks (für die Abdeckungsregelung)
         self.tracks = {}
         self.naechste_id = 1
         self.frame = 0
@@ -258,19 +285,38 @@ class EinfacherTracker:
         for tid, t in self.tracks.items():
             erwartet = self._weg(t, 1 + t["fehlt"])
             tempo = math.hypot(t["v"][0], t["v"][1])
+            vek = t["v"]
+            prior_aktiv = False
+            if self.autobahn and tempo < 0.15 * t["groesse"] and self.fluss is not None \
+                    and math.hypot(*self.fluss) >= 0.1 * t["groesse"] and t["treffer"] <= 3:
+                # Track ohne eigene Geschwindigkeit: erwartet wird die gelernte Strömung
+                prior_aktiv = True
+                vek = self.fluss
+                tempo = math.hypot(*vek)
+                schritte = 1 + t["fehlt"]
+                erwartet = (t["pos"][0] + vek[0] * schritte, t["pos"][1] + vek[1] * schritte)
             for j in range(n):
                 groesse = max(groessen[j], t["groesse"])
                 dx, dy = mitten[j][0] - erwartet[0], mitten[j][1] - erwartet[1]
-                if tempo >= 0.15 * groesse:
+                if tempo >= (0.05 if prior_aktiv else 0.15) * groesse:
                     # Fahrendes Fahrzeug: Suchbereich ist eine Ellipse entlang der Fahrtrichtung. Quer dazu
                     # ist wenig Abweichung erlaubt, rückwärts gar keine (verhindert Sprünge auf Markierungen).
-                    ux, uy = t["v"][0] / tempo, t["v"][1] / tempo
+                    ux, uy = vek[0] / tempo, vek[1] / tempo
                     laengs, quer = dx * ux + dy * uy, -dx * uy + dy * ux
                     zurueck = (mitten[j][0] - t["pos"][0]) * ux + (mitten[j][1] - t["pos"][1]) * uy
                     if zurueck < -0.5 * groesse:
                         continue
-                    abstand = math.hypot(laengs / (self.faktor * groesse * (1 + 0.3 * min(t["fehlt"], 4))),
+                    if self.autobahn:     # Tempo schwankt zwischen Fahrzeugen: Toleranz relativ zum Tempo
+                        laengs_toleranz = 0.6 * groesse + self.laengs_rel * tempo
+                    else:
+                        laengs_toleranz = self.faktor * groesse
+                    abstand = math.hypot(laengs / (laengs_toleranz * (1 + 0.3 * min(t["fehlt"], 4))),
                                          quer / (0.7 * groesse * (1 + 0.15 * min(t["fehlt"], 4))))
+                    if prior_aktiv:
+                        # Sicherheitsnetz: auch ein langsames Fahrzeug nahe der letzten Position wird
+                        # wiedererkannt, selbst wenn die gelernte Strömung nicht zu ihm passt
+                        abstand = min(abstand, math.dist(mitten[j], t["pos"]) /
+                                      (0.8 * groesse * (1 + 0.3 * min(t["fehlt"], 4))))
                 elif t["treffer"] <= 3:
                     # Junger Track ohne bekannte Geschwindigkeit: darf soweit suchen, wie ein Fahrzeug
                     # mit Höchsttempo in der Zwischenzeit kommen kann
@@ -319,6 +365,8 @@ class EinfacherTracker:
             ids[j] = tid
             benutzt_t.add(tid)
             benutzt_d.add(j)
+            if self.autobahn and math.hypot(*neu_v) >= 0.1 * groessen[j]:
+                self._fluss_lernen(neu_v)            # rohe Verschiebung je Frame (unverzerrt)
 
         for tid in list(self.tracks):
             if tid in benutzt_t:
@@ -326,8 +374,10 @@ class EinfacherTracker:
             t = self.tracks[tid]
             t["fehlt"] += 1
             # Fahrzeug hat den Bereich verlassen: am Rand verschwunden oder erwartete Bahn läuft hinaus
-            ausgetreten = t["am_rand"] or not self._innerhalb(self._weg(t, t["fehlt"]), grenzen)
+            ausgetreten = (t["am_rand"] and not self.autobahn) or not self._innerhalb(self._weg(t, t["fehlt"]), grenzen)
             if t["fehlt"] > self.max_luecke or ausgetreten:
+                if self.autobahn:
+                    self.beendet.append(t["treffer"])
                 del self.tracks[tid]
 
         for t in self.tracks.values():
@@ -351,6 +401,36 @@ class EinfacherTracker:
                 self.naechste_id += 1
         return ids
 
+    def _fluss_lernen(self, v):
+        """
+        Strömung (mittlere Verschiebung je ausgewertetem Frame) aus gemessenen Verschiebungen lernen. Robust
+        gegen Fehlzuordnungen: Start mit dem Median der ersten Messungen, danach gleitender Mittelwert, bei
+        dem einzelne Ausreißer in Betrag begrenzt werden.
+        """
+        if self.fluss is None:
+            self._fluss_proben.append(v)
+            if len(self._fluss_proben) >= 5:
+                xs = sorted(p[0] for p in self._fluss_proben)
+                ys = sorted(p[1] for p in self._fluss_proben)
+                self.fluss = (xs[len(xs) // 2], ys[len(ys) // 2])
+                self._fluss_proben.clear()
+            return
+        betrag, b = math.hypot(*self.fluss), math.hypot(*v)
+        if betrag <= 0 or b <= 0:
+            return
+        k = min(1.5, max(0.5, b / betrag)) * betrag / b
+        self.fluss = (0.9 * self.fluss[0] + 0.1 * v[0] * k, 0.9 * self.fluss[1] + 0.1 * v[1] * k)
+
+    def skip_geaendert(self, faktor):
+        """
+        Der Abstand zwischen zwei ausgewerteten Frames hat sich um `faktor` geändert (z. B. skip 2 -> 3 = 1,5):
+        Geschwindigkeiten (je ausgewertetem Frame) entsprechend umrechnen.
+        """
+        for t in self.tracks.values():
+            t["v"] = (t["v"][0] * faktor, t["v"][1] * faktor)
+        if self.fluss is not None:
+            self.fluss = (self.fluss[0] * faktor, self.fluss[1] * faktor)
+
     def geister(self, grenzen=None, max_fehlt=4):
         """Verfolgte Fahrzeuge, die im aktuellen Frame nicht erkannt wurden: (id, (x, y), breite, höhe)."""
         ergebnis = []
@@ -360,6 +440,47 @@ class EinfacherTracker:
                 if self._innerhalb(pos, grenzen):
                     ergebnis.append((tid, pos, t["w"], t["h"]))
         return ergebnis
+
+
+def empfohlener_skip(tempo_je_frame, groesse, max_skip, verhaeltnis=1.0):
+    """
+    Größter Frame-Sprung, bei dem ein Fahrzeug je ausgewertetem Frame höchstens `verhaeltnis` Boxgrößen
+    zurücklegt. Fährt es pro ausgewertetem Frame ungefähr so weit wie der Abstand zum Fahrzeug dahinter,
+    lassen sich beide nicht mehr zuverlässig unterscheiden (Doppel- oder Fehlzählungen).
+    tempo_je_frame: Geschwindigkeit in Pixeln je ORIGINAL-Frame (None = noch unbekannt -> 1).
+    """
+    if not tempo_je_frame or tempo_je_frame <= 0 or not groesse or groesse <= 0:
+        return 1
+    return int(max(1, min(max_skip, math.floor(verhaeltnis * groesse / tempo_je_frame))))
+
+
+class SofortZaehler:
+    """
+    Interstate-Modus (keine Zähllinien): Jedes verfolgte Fahrzeug wird genau einmal gezählt, sobald es
+    erstmals als Fahrzeug gilt. Die Verfolgung dient nur dazu, dasselbe Fahrzeug in den folgenden Frames
+    nicht noch einmal zu zählen.
+    """
+
+    def __init__(self, aufbewahren=1200):
+        self.frame = 0
+        self.aufbewahren = aufbewahren
+        self.gezaehlt = {}          # Schlüssel -> zuletzt gesehen (Frame)
+
+    def neuer_frame(self):
+        self.frame += 1
+        if self.frame % 600 == 0:   # lange nicht gesehene Schlüssel vergessen (Speicher begrenzen)
+            grenze = self.frame - self.aufbewahren
+            self.gezaehlt = {k: f for k, f in self.gezaehlt.items() if f >= grenze}
+
+    def pruefen(self, schluessel, gilt_als_fahrzeug=True):
+        """True, wenn dieses Fahrzeug jetzt zum ersten Mal gezählt wird."""
+        if schluessel in self.gezaehlt:
+            self.gezaehlt[schluessel] = self.frame
+            return False
+        if gilt_als_fahrzeug:
+            self.gezaehlt[schluessel] = self.frame
+            return True
+        return False
 
 
 class UeberfahrtZaehler:
@@ -530,14 +651,17 @@ def zeichne_linien(bild, spuren, zaehler=None):
         cv2.putText(bild, text, (p1[0] + 5, p1[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55, farbe, 2)
 
 
-def zeichne_rois(bild, rois):
+def zeichne_rois(bild, rois, summe=None):
+    """summe (Interstate-Modus): zeigt je Bereich die Zahl der gezählten Fahrzeuge."""
     h, w = bild.shape[:2]
     for i, roi in enumerate(rois):
         farbe = ROI_FARBEN[i % len(ROI_FARBEN)]
         p1, p2 = (int(roi[0] * w), int(roi[1] * h)), (int(roi[2] * w), int(roi[3] * h))
         cv2.rectangle(bild, p1, p2, farbe, 1)
-        cv2.putText(bild, f"Bereich {i + 1}", (p1[0] + 4, p2[1] - 6),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, farbe, 1)
+        text = f"Bereich {i + 1}"
+        if summe is not None:
+            text += f": {sum(v for (stelle, _, _), v in summe.items() if stelle == i)}"
+        cv2.putText(bild, text, (p1[0] + 4, p2[1] - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, farbe, 1)
 
 
 def setup_modus(quelle, datei):
@@ -582,6 +706,8 @@ def setup_modus(quelle, datei):
         hinweis = (f"Modus: BEREICH {len(rois) + 1} (2 Klicks = Ecken)" if zustand["modus"] == "roi"
                    else "Modus: LINIE (2 Klicks)")
         cv2.putText(bild, hinweis, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+        cv2.putText(bild, "Ohne Linie: Interstate-Modus (jedes Fahrzeug zaehlt beim ersten Erkennen im Bereich)",
+                    (8, h - 24), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1)
         cv2.putText(bild, "r=neuer Bereich  c=alle Bereiche loeschen  u=zurueck  Enter=speichern  q=Abbruch",
                     (8, h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1)
         cv2.imshow(fenster, bild)
@@ -603,13 +729,17 @@ def setup_modus(quelle, datei):
             elif verlauf:
                 (rois if verlauf.pop() == "roi" else spuren).pop()
     cv2.destroyAllWindows()
-    if not spuren:
-        raise SystemExit("Keine Linie eingezeichnet.")
+    if not spuren and not rois:
+        raise SystemExit("Weder Zähllinie noch Auswertebereich eingezeichnet.")
     warne_bei_ueberlappung(rois)
     with open(datei, "w", encoding="utf-8") as f:
         json.dump({"rois": rois, "linien": spuren}, f, indent=2, ensure_ascii=False)
-    print(f"{len(spuren)} Linie(n) und {len(rois)} Bereich(e) in {datei} gespeichert. "
-          f"Der Pfeil zeigt die Richtung 'mit_pfeil'. Namen kannst du in der Datei ändern.")
+    if spuren:
+        print(f"{len(spuren)} Linie(n) und {len(rois)} Bereich(e) in {datei} gespeichert. "
+              f"Der Pfeil zeigt die Richtung 'mit_pfeil'. Namen kannst du in der Datei ändern.")
+    else:
+        print(f"{len(rois)} Bereich(e) ohne Zähllinien in {datei} gespeichert -> beim Zählen läuft der "
+              f"Interstate-Modus: Jedes Fahrzeug wird gezählt, sobald es in einem Bereich erkannt wird.")
     return spuren, rois
 
 
@@ -624,10 +754,14 @@ def main():
     ap.add_argument("--conf-low", type=float, default=0.08,
                     help="Untere Schwelle: schwächere Erkennungen dürfen bestehende Tracks weiterführen "
                          "(nur --tracker einfach), neue Tracks brauchen --conf")
-    ap.add_argument("--min-bewegung", type=float, default=0.25,
+    ap.add_argument("--min-bewegung", type=float, default=None,
                     help="Ein Track gilt erst als Fahrzeug, wenn er sich gleichmäßig um so viele Boxgrößen "
-                         "bewegt hat. Filtert statische Fehlerkennungen (Fahrbahnmarkierungen). "
-                         "0 = Filter aus (nur --tracker einfach)")
+                         "bewegt hat. Filtert statische Fehlerkennungen (Fahrbahnmarkierungen). Standard: 0.25, "
+                         "im Interstate-Modus 0 (Fahrzeug zählt sofort). 0 = Filter aus (nur --tracker einfach)")
+    ap.add_argument("--interstate", action="store_true",
+                    help="Interstate-Modus erzwingen: keine Zähllinien, jedes Fahrzeug zählt, sobald es in einem "
+                         "Bereich erkannt wird (Zähllinien der Konfiguration werden ignoriert). Läuft automatisch, "
+                         "wenn die Konfiguration keine Zähllinien enthält")
     ap.add_argument("--ueberlappung", type=float, default=0.3,
                     help="Hätten sich die Boxen zweier Überquerungen an der Linie mindestens so stark überlappt "
                          "(Anteil der kleineren Box) und ist eine davon eine Geisterbox, wird nur die erste "
@@ -649,7 +783,11 @@ def main():
                     help="Standard-Linienhöhe (0-1), falls keine Konfiguration existiert")
     ap.add_argument("--snapshot", action="store_true", help="URL ist ein einzelnes JPEG-Bild")
     ap.add_argument("--interval", type=float, default=0.5, help="Abrufintervall (nur Snapshot)")
-    ap.add_argument("--csv", default="verkehr.csv", help="CSV-Datei für Minutenwerte")
+    ap.add_argument("--csv", default=None,
+                    help="CSV-Datei für die Minutenwerte. Ohne Angabe legt jeder Programmlauf eine neue Datei "
+                         "tracking-data-JJJJ-MM-TT-HH-MM-SS.csv an. Mit Angabe wird an diese Datei angehängt")
+    ap.add_argument("--csv-ordner", default=".",
+                    help="Ordner für die automatisch benannten CSV-Dateien (wird bei Bedarf angelegt)")
     ap.add_argument("--tracker", choices=["einfach", "bytetrack"], default="einfach",
                     help="'einfach' (Standard) erkennt Fahrzeuge auch bei Frame-Sprüngen zuverlässiger wieder; "
                          "'bytetrack' ist der Ultralytics-Tracker")
@@ -711,6 +849,17 @@ def main():
             rois_rel.append(werte)
         warne_bei_ueberlappung(rois_rel)
 
+    # Interstate-Modus: keine Zähllinien -> jedes Fahrzeug zählt, sobald es in einem Bereich erkannt wird
+    interstate = args.interstate or not spuren
+    if interstate:
+        if not rois_rel:
+            raise SystemExit("Interstate-Modus (keine Zähllinien) braucht mindestens einen Auswertebereich: "
+                             "mit --setup einen Bereich einzeichnen (Taste r) oder --roi angeben.")
+        spuren = []
+        print(f"Interstate-Modus: keine Zähllinien, jedes Fahrzeug wird gezählt, sobald es in einem der "
+              f"{len(rois_rel)} Bereich(e) erkannt wird.")
+    min_bewegung = args.min_bewegung if args.min_bewegung is not None else (0.0 if interstate else 0.25)
+
     # Ohne Bereich wird das ganze Bild ausgewertet (None). Jeder Bereich bekommt ein eigenes Modell,
     # damit jeder Tracker nur "seine" Bilder sieht und IDs sich nicht vermischen.
     bereiche = rois_rel if rois_rel else [None]
@@ -720,15 +869,35 @@ def main():
     else:
         modelle = [YOLO(args.model) for _ in bereiche]     # ByteTrack hält Zustand pro Modell
     roh_modell = YOLO(args.model) if args.debug and args.tracker == "bytetrack" else None
-    einfache_tracker = [EinfacherTracker(min_bewegung=args.min_bewegung) for _ in bereiche]
+    if interstate:    # Strömung lernen, Rand nicht sofort löschen, nur kurz festhalten (Zuordnung für die Zählung)
+        einfache_tracker = [EinfacherTracker(max_luecke=3, min_bewegung=min_bewegung, max_tempo=3.0, autobahn=True)
+                            for _ in bereiche]
+    else:
+        einfache_tracker = [EinfacherTracker(min_bewegung=min_bewegung) for _ in bereiche]
+
+    # Zählstellen: Zähllinien mit zwei Richtungen, im Interstate-Modus die Bereiche
+    if interstate:
+        stellen = [(f"Bereich {i + 1}", ("im_bereich",)) for i in range(len(bereiche))]
+    else:
+        stellen = [(sp["name"], ("mit_pfeil", "gegen_pfeil")) for sp in spuren]
 
     namen = {k: "Fahrzeug" for k in FAHRZEUGE} if args.zusammenfassen else dict(FAHRZEUGE)
     typen = list(dict.fromkeys(namen.values()))
-    with open(args.csv, "a", newline="", encoding="utf-8") as f:
+    if args.csv:
+        csv_pfad = args.csv
+    else:                                  # jeder Lauf schreibt in eine neue, nach dem Start benannte Datei
+        os.makedirs(args.csv_ordner, exist_ok=True)
+        csv_pfad = neuer_csv_name(ordner=args.csv_ordner)
+    with open(csv_pfad, "a", newline="", encoding="utf-8") as f:
         if f.tell() == 0:
             csv.writer(f).writerow(["zeit", "linie", "richtung", *typen, "gesamt"])
+    print(f"Zählwerte werden gespeichert in: {csv_pfad}")
 
     zaehler = UeberfahrtZaehler(ueberlappung=args.ueberlappung)   # Schlüssel: (bereich, track_id)
+    sofort = SofortZaehler()                              # Interstate-Modus
+    groesse_ema = None                                    # typische Fahrzeuggröße (Pixel), Interstate-Modus
+    empf_skip, warnung_gezeigt = None, False
+    sichtungen_summe = sichtungen_anzahl = 0              # Ø Sichtungen je Fahrzeug (Interstate-Modus)
     stimmen = defaultdict(lambda: defaultdict(float))     # (bereich, track_id) -> Typ -> Konfidenzsumme
     summe = defaultdict(int)
     minute = defaultdict(int)
@@ -751,6 +920,8 @@ def main():
             debug_teile = []
             geister_alle = []                  # (id, (x, y), breite, höhe) aller Bereiche für die Anzeige
             zaehler.neuer_frame()
+            sofort.neuer_frame()
+            groessen_frame = []
             for bi, roi in enumerate(bereiche):
                 rx1, ry1, rx2, ry2 = roi_in_pixel(roi, w, h)
                 ausschnitt = frame[ry1:ry2, rx1:rx2]
@@ -794,7 +965,7 @@ def main():
                                           (0, 0, 255), 1)
 
                 geister_bereich = []
-                if args.tracker == "einfach":
+                if args.tracker == "einfach" and not interstate:
                     geister_bereich = einfache_tracker[bi].geister((rx1, ry1, rx2, ry2))
                     geister_alle.extend(geister_bereich)
 
@@ -814,10 +985,17 @@ def main():
                         bewegt, neu_bewegt, lauf = track["bewegt"], track["neu_bewegt"], track["lauf_laenge"]
                     else:
                         bewegt, neu_bewegt, lauf = True, False, 0
-                    for i, richtung in zaehler.pruefen(schluessel, mitte, pix, bewegt, neu_bewegt, lauf,
-                                                       box=(x1, y1, x2, y2)):
-                        summe[(i, richtung, typ)] += 1
-                        minute[(i, richtung, typ)] += 1
+                    if interstate:
+                        # kein Linien-Tracking: zählen, sobald das Fahrzeug erstmals als Fahrzeug gilt
+                        groessen_frame.append(max(x2 - x1, y2 - y1))
+                        if sofort.pruefen(schluessel, bewegt):
+                            summe[(bi, "im_bereich", typ)] += 1
+                            minute[(bi, "im_bereich", typ)] += 1
+                    else:
+                        for i, richtung in zaehler.pruefen(schluessel, mitte, pix, bewegt, neu_bewegt, lauf,
+                                                           box=(x1, y1, x2, y2)):
+                            summe[(i, richtung, typ)] += 1
+                            minute[(i, richtung, typ)] += 1
 
                     if args.show and bewegt:
                         cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
@@ -826,7 +1004,7 @@ def main():
 
                 # Fahrzeuge, die gerade nicht erkannt werden: überquert die Geisterbox die Linie, zählt das
                 # Fahrzeug als das, was es zuvor (per Mehrheit über alle Frames) erkannt wurde
-                if args.tracker == "einfach" and not args.ohne_geisterzaehlung:
+                if args.tracker == "einfach" and not interstate and not args.ohne_geisterzaehlung:
                     for gid, (gx, gy), gw, gh in geister_bereich:
                         schluessel = (bi, gid)
                         abstimmung = stimmen.get(schluessel)
@@ -840,8 +1018,38 @@ def main():
                             minute[(i, richtung, typ)] += 1
 
             ema = gesamt_dauer if ema is None else 0.9 * ema + 0.1 * gesamt_dauer
-            if auto_skip and not args.snapshot:
-                skip = int(max(1, min(args.max_skip, math.ceil(ema * quelle.fps))))
+            skip_cpu = int(max(1, min(args.max_skip, math.ceil(ema * quelle.fps))))   # reicht für Echtzeit
+            if interstate:
+                if groessen_frame:
+                    mittel = sum(groessen_frame) / len(groessen_frame)
+                    groesse_ema = mittel if groesse_ema is None else 0.95 * groesse_ema + 0.05 * mittel
+                for tr in einfache_tracker:
+                    for treffer in tr.beendet:
+                        sichtungen_summe += treffer
+                        sichtungen_anzahl += 1
+                    tr.beendet.clear()
+                # größter Frame-Sprung, bei dem Fahrzeuge noch zuverlässig wiedererkannt werden
+                tempi = [math.hypot(*tr.fluss) / skip for tr in einfache_tracker if tr.fluss is not None] \
+                    if args.tracker == "einfach" else []
+                empf_skip = empfohlener_skip(max(tempi) if tempi else None, groesse_ema, args.max_skip) \
+                    if args.tracker == "einfach" else None
+                if auto_skip and not args.snapshot:
+                    skip_neu = max(skip_cpu, empf_skip or 1)       # so wenig Frames wie sinnvoll auswerten
+                    if skip_neu != skip:
+                        for tr in einfache_tracker:
+                            tr.skip_geaendert(skip_neu / skip)
+                        skip = skip_neu
+                    if empf_skip is not None and skip_cpu > empf_skip and not warnung_gezeigt:
+                        print(f"[Warnung] Die Rechenleistung reicht nicht, um alle nötigen Frames auszuwerten "
+                              f"(empfohlen: skip {empf_skip}, nötig: {skip_cpu}). Fahrzeuge können falsch "
+                              f"gezählt werden. Kleineren Bereich, --imgsz oder ein kleineres Modell wählen.")
+                        warnung_gezeigt = True
+                elif empf_skip is not None and skip > empf_skip and not warnung_gezeigt:
+                    print(f"[Warnung] --skip {skip} ist für dieses Verkehrstempo zu groß (empfohlen: höchstens "
+                          f"{empf_skip}). Fahrzeuge können übersehen oder doppelt gezählt werden.")
+                    warnung_gezeigt = True
+            elif auto_skip and not args.snapshot:
+                skip = skip_cpu
             verarbeitet += 1
             if args.debug and verarbeitet % 10 == 0:
                 print(f"[debug] Frame {verarbeitet}: " + " | ".join(debug_teile) +
@@ -850,12 +1058,12 @@ def main():
             # Minutenwerte wegschreiben
             jetzt = datetime.now().replace(second=0, microsecond=0)
             if jetzt > minute_start:
-                with open(args.csv, "a", newline="", encoding="utf-8") as f:
+                with open(csv_pfad, "a", newline="", encoding="utf-8") as f:
                     wr = csv.writer(f)
-                    for i, s in enumerate(spuren):
-                        for richtung in ("mit_pfeil", "gegen_pfeil"):
+                    for i, (name, richtungen) in enumerate(stellen):
+                        for richtung in richtungen:
                             werte = [minute[(i, richtung, t)] for t in typen]
-                            wr.writerow([minute_start.isoformat(), s["name"], richtung, *werte, sum(werte)])
+                            wr.writerow([minute_start.isoformat(), name, richtung, *werte, sum(werte)])
                 print(f"[{minute_start:%H:%M}] {sum(minute.values())} Fahrzeuge in dieser Minute "
                       f"({ema * 1000:.0f} ms/Frame, skip {skip})")
                 minute.clear()
@@ -870,7 +1078,7 @@ def main():
                                   (int(gx + gw / 2), int(gy + gh / 2)), (0, 255, 255), 1)
                     cv2.putText(frame, f"#{tid} (nicht erkannt)", (int(gx - gw / 2), int(gy - gh / 2) - 4),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
-                zeichne_rois(frame, rois_rel)
+                zeichne_rois(frame, rois_rel, summe if interstate else None)
                 zeichne_linien(frame, spuren, summe)
                 cv2.putText(frame, f"{ema * 1000:.0f} ms/Frame  skip {skip}  imgsz {imgsz}",
                             (8, h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
@@ -887,8 +1095,12 @@ def main():
             pass
         print("\nEndergebnis:")
         for (i, richtung, typ), n in sorted(summe.items()):
-            print(f"  {spuren[i]['name']:10s} {richtung:12s} {typ:9s} {n}")
-        if args.tracker == "einfach":
+            print(f"  {stellen[i][0]:10s} {richtung:12s} {typ:9s} {n}")
+        if interstate:
+            if sichtungen_anzahl:
+                print(f"Interstate-Modus: Ø {sichtungen_summe / sichtungen_anzahl:.1f} Sichtungen je Fahrzeug, "
+                      f"verwendeter skip {skip}" + (f", empfohlen höchstens {empf_skip}" if empf_skip else ""))
+        elif args.tracker == "einfach":
             print(f"davon über Geisterbox gezählt: {zaehler.statistik['geisterbox']}, "
                   f"wegen enger Überlappung nicht doppelt gezählt: {zaehler.statistik['unterdrueckt']}")
 
